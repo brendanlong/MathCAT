@@ -1345,12 +1345,13 @@ impl Prefilter {
             return Some( if &captures[1] == "=" {PrefilterCondition::ChildCount(n)} else {PrefilterCondition::MinChildCount(n)} );
         }
         if let Some(captures) = HAS_ATTRIBUTE.captures(conjunct) {
-            // "@a[...]" could be followed by more ("@a[...] or @b"), but only if there is a top-level operator
-            if split_at_top_level_operator(conjunct, "or").is_some_and(|parts| parts.len() == 1) {
-                let name = captures.get(1).or(captures.get(2)).unwrap().as_str();
-                return Some( PrefilterCondition::HasAttribute(name.to_string()) );
+            // "@a[...]" must be the whole test: "@a[...] | @b" and "@a[...] = false()" don't need the attribute
+            let predicate = &conjunct[captures.get(0).unwrap().end()..];
+            if !predicate.is_empty() && !(predicate.ends_with(']') && is_balanced(&predicate[..predicate.len()-1])) {
+                return None;
             }
-            return None;
+            let name = captures.get(1).or(captures.get(2)).unwrap().as_str();
+            return Some( PrefilterCondition::HasAttribute(name.to_string()) );
         }
         if let Some(captures) = BRACKETED.captures(conjunct) {
             return Some( PrefilterCondition::Bracketed(captures[1].to_string(), captures[2].to_string()) );
@@ -1388,26 +1389,29 @@ fn strip_outer_parens(xpath: &str) -> &str {
     let mut xpath = xpath;
     while xpath.starts_with('(') && xpath.ends_with(')') {
         let inner = &xpath[1..xpath.len()-1];
-        // the parens wrap everything only if the inner part is balanced on its own
-        let mut depth = 0i32;
-        let mut quote = None;
-        for ch in inner.chars() {
-            match (quote, ch) {
-                (Some(q), _) => if ch == q {quote = None},
-                (None, '\'') | (None, '"') => quote = Some(ch),
-                (None, '(') => depth += 1,
-                (None, ')') => {
-                    depth -= 1;
-                    if depth < 0 {
-                        return xpath;
-                    }
-                },
-                _ => (),
-            }
+        if !is_balanced(inner) {
+            return xpath;
         }
         xpath = inner.trim();
     }
     return xpath;
+}
+
+/// True if every paren and bracket in `xpath` is closed, in order, and none closes something opened before `xpath`
+fn is_balanced(xpath: &str) -> bool {
+    let mut open = Vec::new();
+    let mut quote = None;
+    for ch in xpath.chars() {
+        match (quote, ch) {
+            (Some(q), _) => if ch == q {quote = None},
+            (None, '\'') | (None, '"') => quote = Some(ch),
+            (None, '(') | (None, '[') => open.push(ch),
+            (None, ')') => if open.pop() != Some('(') {return false},
+            (None, ']') => if open.pop() != Some('[') {return false},
+            _ => (),
+        }
+    }
+    return open.is_empty() && quote.is_none();
 }
 
 /// Split `xpath` at each use of the operator ("and" or "or") that is not nested inside parens, brackets, or quotes.
@@ -1448,17 +1452,16 @@ fn split_at_top_level_operator<'a>(xpath: &'a str, operator: &str) -> Option<Vec
     parts.push(&xpath[start..]);
     return Some(parts);
 
-    /// "and" and "or" are operators only where an operator can occur; elsewhere they are names (e.g, "self::or", "$and", "android")
+    /// Errs on the side of calling a name an operator ("a.or" is a legal name): seeing an "or" that isn't there
+    /// only loses conditions, but missing a real one would treat part of an alternative as required.
     fn is_operator_at(bytes: &[u8], i: usize, len: usize) -> bool {
-        let is_name_char = |ch: u8| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-' || ch == b'.' || ch >= 0x80;
-        let before_ok = i > 0 && !is_name_char(bytes[i-1]) || i > 0 && bytes[i-1] == b'.' && (i == 1 || !is_name_char(bytes[i-2]));
-        let after_ok = i + len < bytes.len() && !is_name_char(bytes[i+len]) && bytes[i+len] != b':';
-        if !before_ok || !after_ok {
+        let is_name_char = |ch: u8| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-' || ch >= 0x80;
+        if i == 0 || is_name_char(bytes[i-1]) || i + len >= bytes.len() || is_name_char(bytes[i+len]) || bytes[i+len] == b':' {
             return false;
         }
-        // the token before an operator ends an operand
+        // "@or", "$or", and "self::or" are names
         let previous = bytes[..i].iter().rev().find(|ch| !ch.is_ascii_whitespace());
-        return previous.is_some_and(|ch| !b"@:([,/|+-=<>!$".contains(ch));
+        return previous.is_some_and(|ch| !b"@$:".contains(ch));
     }
 }
 
@@ -3234,6 +3237,8 @@ cfg_if::cfg_if! {if #[cfg(not(feature = "include-zip"))] {
             PrefilterCondition::Bracketed("(".to_string(), ")".to_string()),
         ]);
         assert_eq!(Prefilter::build("count(*) >= 5 and *[1][.='|']").conditions, vec![PrefilterCondition::MinChildCount(5)]);
+        assert_eq!(Prefilter::build("@data-intent-property[contains(., ':pause')]").conditions,
+                   vec![PrefilterCondition::HasAttribute("data-intent-property".to_string())]);
         assert_eq!(Prefilter::build("contains(@data-intent-property, ':silent:')").conditions,
                    vec![PrefilterCondition::HasAttribute("data-intent-property".to_string())]);
     }
@@ -3262,6 +3267,14 @@ cfg_if::cfg_if! {if #[cfg(not(feature = "include-zip"))] {
         assert!(Prefilter::build("self::or and $and").conditions.is_empty());
         assert!(Prefilter::build("count(*)=3 and").conditions.len() <= 1);
         assert!(Prefilter::build("count(*)=3 and (").conditions.is_empty());
+        // the attribute test is only part of a larger expression
+        assert!(Prefilter::build("@a[1] | @b").conditions.is_empty());
+        assert!(Prefilter::build("@a[.='x'] = false()").conditions.is_empty());
+        assert!(Prefilter::build("@a[.='x'][.='y'] = false()").conditions.is_empty());
+        // an "or" directly after "..", a number, or the root path
+        assert!(Prefilter::build("count(*)=2 and ..or @x").conditions.is_empty());
+        assert!(Prefilter::build("count(*)=2 and 1.or @x").conditions.is_empty());
+        assert!(Prefilter::build("count(*)=2 and / or @x").conditions.is_empty());
     }
 
     /// Conditions are checked against the element itself: its text, element children, and attributes.
