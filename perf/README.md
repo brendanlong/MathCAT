@@ -54,8 +54,9 @@ equation is parsed once. The time goes to *evaluating* the compiled XPath:
 - The single most expensive rule is `turn-off` in `intent.yaml`. It is tried on every element and walks
   all of the element's ancestors; it was 14% of matching time.
 
-After changes 1–5, roughly: rule matching 35%, `set_mathml` 28% (canonicalization 13%, building the
-MathML string it returns 6%, parsing 4%), building a fresh XPath context twice per equation 7%.
+After changes 1–5, a profile of the wiki input shows: rule matching 35%, `set_mathml` 27% (cleanup and
+canonicalization 15%, building the MathML string it returns 6%, parsing 4%), building a fresh XPath
+context twice per equation 8%.
 
 ## The prefilter (change 5)
 
@@ -70,7 +71,7 @@ proposing upstream would read the parsed expression instead.
 
 ## Ideas that were not measured
 
-- Reusing the XPath context (function table and preference variables) across calls: about 7% of time.
+- Reusing the XPath context (function table and preference variables) across calls: about 8% of time.
 - Letting callers skip the MathML string `set_mathml` returns: about 6%.
 - Rewriting the `turn-off` rule so it does not walk the ancestors of every element.
 - More interpreter work in sxd-xpath (stop at the first match when only "is there any node" is needed,
