@@ -1278,6 +1278,193 @@ impl MyXPath {
     }
 }
 
+/// A cheap test that every element matching a rule's `match` xpath must pass.
+/// It lets `find_match` skip the (much slower) xpath evaluation for most rules that can't match.
+/// Only a few simple shapes at the top-level of the xpath are recognized; anything else is ignored,
+/// which is always safe: the xpath itself is still evaluated for every element the prefilter lets through.
+#[derive(Debug, Default)]
+struct Prefilter {
+    conditions: Vec<PrefilterCondition>,
+}
+
+#[derive(Debug, PartialEq)]
+enum PrefilterCondition {
+    ChildCount(usize),                  // count(*)=n
+    MinChildCount(usize),               // count(*)>=n
+    Text(Vec<String>),                  // .='a' or .='b'
+    HasAttribute(String),               // @a, @a[...], @a='b', contains(@a, 'b')
+    Bracketed(String, String),          // IsBracketed(., '(', ')')
+}
+
+/// What a `Prefilter` needs to know about an element. It is computed at most once for all the rules tried on the element.
+struct PrefilterFacts<'c> {
+    mathml: Element<'c>,
+    n_children: Option<usize>,
+    text: Option<String>,
+}
+
+impl<'c> PrefilterFacts<'c> {
+    fn new(mathml: Element<'c>) -> PrefilterFacts<'c> {
+        return PrefilterFacts { mathml, n_children: None, text: None };
+    }
+
+    fn n_children(&mut self) -> usize {
+        let mathml = self.mathml;
+        return *self.n_children.get_or_insert_with(|| mathml.children().iter().filter(|child| child.element().is_some()).count());
+    }
+
+    fn text(&mut self) -> &str {
+        let mathml = self.mathml;
+        return self.text.get_or_insert_with(|| Node::Element(mathml).string_value());
+    }
+}
+
+impl Prefilter {
+    fn build(xpath: &str) -> Prefilter {
+        let Some(disjuncts) = split_at_top_level_operator(xpath, "or") else {
+            return Prefilter::default();
+        };
+        if disjuncts.len() > 1 {
+            // "a or b" -- only useful if all the alternatives test the text
+            return Prefilter { conditions: Prefilter::text_condition(&disjuncts).into_iter().collect() };
+        }
+        let Some(conjuncts) = split_at_top_level_operator(xpath, "and") else {
+            return Prefilter::default();
+        };
+        return Prefilter { conditions: conjuncts.iter().filter_map(|conjunct| Prefilter::condition(conjunct)).collect() };
+    }
+
+    fn condition(conjunct: &str) -> Option<PrefilterCondition> {
+        static CHILD_COUNT: Lazy<Regex> = lazy_regex!(r"^count\(\s*\*\s*\)\s*(=|>=)\s*(\d+)$");
+        static HAS_ATTRIBUTE: Lazy<Regex> = lazy_regex!(r#"^(?:@([\w-]+)\s*(?:$|\[|=\s*'[^']*'$)|contains\(\s*@([\w-]+)\s*,\s*'[^']+'\s*\)$)"#);
+        static BRACKETED: Lazy<Regex> = lazy_regex!(r"^IsBracketed\(\s*\.\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)$");
+
+        let conjunct = strip_outer_parens(conjunct.trim());
+        if let Some(captures) = CHILD_COUNT.captures(conjunct) {
+            let n = captures[2].parse::<usize>().ok()?;
+            return Some( if &captures[1] == "=" {PrefilterCondition::ChildCount(n)} else {PrefilterCondition::MinChildCount(n)} );
+        }
+        if let Some(captures) = HAS_ATTRIBUTE.captures(conjunct) {
+            // "@a[...]" must be the whole test: "@a[...] | @b" and "@a[...] = false()" don't need the attribute
+            let predicate = &conjunct[captures.get(0).unwrap().end()..];
+            if !predicate.is_empty() && !(predicate.ends_with(']') && is_balanced(&predicate[..predicate.len()-1])) {
+                return None;
+            }
+            let name = captures.get(1).or(captures.get(2)).unwrap().as_str();
+            return Some( PrefilterCondition::HasAttribute(name.to_string()) );
+        }
+        if let Some(captures) = BRACKETED.captures(conjunct) {
+            return Some( PrefilterCondition::Bracketed(captures[1].to_string(), captures[2].to_string()) );
+        }
+        return Prefilter::text_condition(&split_at_top_level_operator(conjunct, "or")?);
+    }
+
+    /// If every alternative has the form `.='text'`, return the condition that the text is one of them
+    fn text_condition(alternatives: &[&str]) -> Option<PrefilterCondition> {
+        static TEXT_EQUALS: Lazy<Regex> = lazy_regex!(r#"^\.\s*=\s*(?:'([^']*)'|"([^"]*)")$"#);
+        let texts = alternatives.iter()
+            .map(|alternative| TEXT_EQUALS.captures(strip_outer_parens(alternative.trim()))
+                        .map(|captures| captures.get(1).or(captures.get(2)).unwrap().as_str().to_string()))
+            .collect::<Option<Vec<String>>>()?;
+        return Some( PrefilterCondition::Text(texts) );
+    }
+
+    fn may_match(&self, facts: &mut PrefilterFacts) -> bool {
+        return self.conditions.iter().all(|condition| match condition {
+            PrefilterCondition::ChildCount(n) => facts.n_children() == *n,
+            PrefilterCondition::MinChildCount(n) => facts.n_children() >= *n,
+            PrefilterCondition::Text(texts) => {
+                let text = facts.text();
+                texts.iter().any(|t| t == text)
+            },
+            PrefilterCondition::HasAttribute(name) => facts.mathml.attribute(name.as_str()).is_some(),
+            PrefilterCondition::Bracketed(left, right) =>
+                crate::xpath_functions::IsBracketed::is_bracketed(facts.mathml, left, right, false, true),
+        });
+    }
+}
+
+/// Remove parens that wrap all of `xpath`: "(a or b)" => "a or b", but "(a) or (b)" is unchanged
+fn strip_outer_parens(xpath: &str) -> &str {
+    let mut xpath = xpath;
+    while xpath.starts_with('(') && xpath.ends_with(')') {
+        let inner = &xpath[1..xpath.len()-1];
+        if !is_balanced(inner) {
+            return xpath;
+        }
+        xpath = inner.trim();
+    }
+    return xpath;
+}
+
+/// True if every paren and bracket in `xpath` is closed, in order, and none closes something opened before `xpath`
+fn is_balanced(xpath: &str) -> bool {
+    let mut open = Vec::new();
+    let mut quote = None;
+    for ch in xpath.chars() {
+        match (quote, ch) {
+            (Some(q), _) => if ch == q {quote = None},
+            (None, '\'') | (None, '"') => quote = Some(ch),
+            (None, '(') | (None, '[') => open.push(ch),
+            (None, ')') => if open.pop() != Some('(') {return false},
+            (None, ']') => if open.pop() != Some('[') {return false},
+            _ => (),
+        }
+    }
+    return open.is_empty() && quote.is_none();
+}
+
+/// Split `xpath` at each use of the operator ("and" or "or") that is not nested inside parens, brackets, or quotes.
+/// Returns None if `xpath` can't be understood (unbalanced).
+fn split_at_top_level_operator<'a>(xpath: &'a str, operator: &str) -> Option<Vec<&'a str>> {
+    let bytes = xpath.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == b'\'' || ch == b'"' {
+            quote = Some(ch);
+        } else if ch == b'(' || ch == b'[' {
+            depth += 1;
+        } else if ch == b')' || ch == b']' {
+            depth -= 1;
+            if depth < 0 {
+                return None;
+            }
+        } else if depth == 0 && bytes[i..].starts_with(operator.as_bytes()) && is_operator_at(bytes, i, operator.len()) {
+            parts.push(&xpath[start..i]);
+            i += operator.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    parts.push(&xpath[start..]);
+    return Some(parts);
+
+    /// Errs on the side of calling a name an operator ("a.or" is a legal name): seeing an "or" that isn't there
+    /// only loses conditions, but missing a real one would treat part of an alternative as required.
+    fn is_operator_at(bytes: &[u8], i: usize, len: usize) -> bool {
+        let is_name_char = |ch: u8| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-' || ch >= 0x80;
+        if i == 0 || is_name_char(bytes[i-1]) || i + len >= bytes.len() || is_name_char(bytes[i+len]) || bytes[i+len] == b':' {
+            return false;
+        }
+        // "@or", "$or", and "self::or" are names
+        let previous = bytes[..i].iter().rev().find(|ch| !ch.is_ascii_whitespace());
+        return previous.is_some_and(|ch| !b"@$:".contains(ch));
+    }
+}
+
 // 'SpeechPattern' holds a single pattern.
 // Some info is not needed beyond converting the Yaml to the SpeechPattern, but is useful for error reporting.
 // The two main parts are the pattern to be matched and the replacements to do if there is a match.
@@ -1288,6 +1475,7 @@ struct SpeechPattern {
     tag_name: String,
     file_name: String,
     pattern: MyXPath,                     // the xpath expr to attempt to match
+    prefilter: Prefilter,                 // quick check that rules out most elements 'pattern' can't match
     match_uses_var_defs: bool,            // include var_defs in context for matching
     var_defs: VariableDefinitions,        // any variable definitions [can be and probably is an empty vector most of the time]
     replacements: ReplacementArray,       // the replacements in case there is a match
@@ -1375,6 +1563,7 @@ impl SpeechPattern  {
                     tag_name: tag_name.clone(),
                     file_name: file.to_str().unwrap().to_string(),
                     match_uses_var_defs: dict["variables"].is_array() && pattern_xpath.rc.string.contains('$'),    // FIX: should look at var_defs for actual name
+                    prefilter: Prefilter::build(&pattern_xpath.rc.string),
                     pattern: pattern_xpath,
                     var_defs: VariableDefinitions::build(&dict["variables"])
                         .with_context(|| {
@@ -2469,8 +2658,12 @@ impl<'c, 's:'c, 'r, 'm:'c> SpeechRulesWithContext<'c, 's,'m> {
     }
 
     fn find_match<T:TreeOrString<'c, 'm, T>>(&'r mut self, rule_vector: &[Box<SpeechPattern>], mathml: Element<'c>) -> Result<Option<T>> {
+        let mut prefilter_facts = PrefilterFacts::new(mathml);
         for pattern in rule_vector {
             // debug!("Pattern name: {}", pattern.pattern_name);
+            if !pattern.prefilter.may_match(&mut prefilter_facts) {
+                continue;
+            }
             // always pushing and popping around the match test would be a little cleaner, but push/pop is relatively expensive,
             //   so we optimize and only push first if the variables are needed to do the match
             if pattern.match_uses_var_defs {
@@ -3033,5 +3226,72 @@ cfg_if::cfg_if! {if #[cfg(not(feature = "include-zip"))] {
     //     assert!(result.is_ok());
     //     assert_eq!(result.unwrap(), r#"DEBUG(*[2]/*[3][DEBUG(text()='(')], "DEBUG(*[2]/*[3][DEBUG(text()='(')], \"text()='(')]\")"#);
     // }
+
+    /// The top-level "and" parts of a match that have a recognized shape become conditions; the rest are ignored.
+    #[test]
+    fn prefilter_uses_recognized_conjuncts() {
+        let prefilter = Prefilter::build("count(*)=3 and (*[1][.='tr' or .='Tr']) and *[2][.='x'] and @intent and IsBracketed(., '(', ')')");
+        assert_eq!(prefilter.conditions, vec![
+            PrefilterCondition::ChildCount(3),
+            PrefilterCondition::HasAttribute("intent".to_string()),
+            PrefilterCondition::Bracketed("(".to_string(), ")".to_string()),
+        ]);
+        assert_eq!(Prefilter::build("count(*) >= 5 and *[1][.='|']").conditions, vec![PrefilterCondition::MinChildCount(5)]);
+        assert_eq!(Prefilter::build("@data-intent-property[contains(., ':pause')]").conditions,
+                   vec![PrefilterCondition::HasAttribute("data-intent-property".to_string())]);
+        assert_eq!(Prefilter::build("contains(@data-intent-property, ':silent:')").conditions,
+                   vec![PrefilterCondition::HasAttribute("data-intent-property".to_string())]);
+    }
+
+    /// Alternatives that all compare the element's text become one condition, whether or not other tests are and'd with them.
+    #[test]
+    fn prefilter_collects_text_alternatives() {
+        let texts = PrefilterCondition::Text(vec!["log".to_string(), "ln".to_string()]);
+        assert_eq!(Prefilter::build(".='log' or .='ln'").conditions, vec![PrefilterCondition::Text(vec!["log".to_string(), "ln".to_string()])]);
+        assert_eq!(Prefilter::build("(.='log' or .='ln') and following-sibling::*[1][.='x']").conditions, vec![texts]);
+        assert_eq!(Prefilter::build(".=' and ' or .=\"or\"").conditions, vec![PrefilterCondition::Text(vec![" and ".to_string(), "or".to_string()])]);
+    }
+
+    /// A match that could be true without the condition holding must not get that condition.
+    #[test]
+    fn prefilter_ignores_what_it_cannot_rely_on() {
+        // an "or" at the top-level means no single part has to be true
+        assert!(Prefilter::build("count(*)=3 or @intent").conditions.is_empty());
+        assert!(Prefilter::build("$SpeechStyle = 'LiteralSpeak' or ancestor-or-self::*[contains(@data-intent-property, ':literal:')]").conditions.is_empty());
+        assert!(Prefilter::build("@data-chem-element > 0 or contains(@data-intent-property, ':chemical-element:')").conditions.is_empty());
+        // negations, nested tests, and tests of other nodes say nothing about this element
+        assert!(Prefilter::build("not(@intent) and not(count(*)=3) and *[1][count(*)=2] and parent::*[@intent]").conditions.is_empty());
+        // true when the attribute is missing
+        assert!(Prefilter::build("contains(@intent, '')").conditions.is_empty());
+        // "and"/"or" that are names, not operators
+        assert!(Prefilter::build("self::or and $and").conditions.is_empty());
+        assert!(Prefilter::build("count(*)=3 and").conditions.len() <= 1);
+        assert!(Prefilter::build("count(*)=3 and (").conditions.is_empty());
+        // the attribute test is only part of a larger expression
+        assert!(Prefilter::build("@a[1] | @b").conditions.is_empty());
+        assert!(Prefilter::build("@a[.='x'] = false()").conditions.is_empty());
+        assert!(Prefilter::build("@a[.='x'][.='y'] = false()").conditions.is_empty());
+        // an "or" directly after "..", a number, or the root path
+        assert!(Prefilter::build("count(*)=2 and ..or @x").conditions.is_empty());
+        assert!(Prefilter::build("count(*)=2 and 1.or @x").conditions.is_empty());
+        assert!(Prefilter::build("count(*)=2 and / or @x").conditions.is_empty());
+    }
+
+    /// Conditions are checked against the element itself: its text, element children, and attributes.
+    #[test]
+    fn prefilter_tests_the_element() {
+        let package = sxd_document_no_unsafe::parser::parse("<math><mrow intent='x'><mo>(</mo><mi>sin</mi><mo>)</mo></mrow></math>").unwrap();
+        let mrow = as_element(crate::interface::get_element(&package).children()[0]);
+        let mi = as_element(mrow.children()[1]);
+        let may_match = |xpath: &str, element: Element| Prefilter::build(xpath).may_match(&mut PrefilterFacts::new(element));
+        assert!(may_match("count(*)=3 and @intent and IsBracketed(., '(', ')')", mrow));
+        assert!(!may_match("count(*)=2", mrow));
+        assert!(!may_match("count(*)>=4", mrow));
+        assert!(!may_match("@data-x", mrow));
+        assert!(!may_match("IsBracketed(., '[', ']')", mrow));
+        assert!(may_match(".='(sin)'", mrow));
+        assert!(may_match(".='cos' or .='sin'", mi));
+        assert!(!may_match(".='cos' or .='tan'", mi));
+    }
 
 }

@@ -1,0 +1,157 @@
+From 506777678398374a7fda2cfa7d549fb010f48006 Mon Sep 17 00:00:00 2001
+From: Brendan Long <self@brendanlong.com>
+Date: Wed, 11 Nov 2026 22:55:30 +0000
+Subject: [PATCH 1/4] Sort nodes into document order without indexing the whole
+ document
+
+---
+ src/nodeset.rs | 108 +++++++++++++++++++++++++++----------------------
+ 1 file changed, 59 insertions(+), 49 deletions(-)
+
+diff --git a/src/nodeset.rs b/src/nodeset.rs
+index 3fd2213..8799615 100644
+--- a/src/nodeset.rs
++++ b/src/nodeset.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::borrow::ToOwned;
+ use std::collections::hash_set;
+-use std::collections::{HashMap, HashSet};
++use std::collections::HashSet;
+ use std::iter::{FromIterator, IntoIterator};
+ use std::usize;
+ 
+@@ -405,72 +405,82 @@ impl<'d> Nodeset<'d> {
+     ///
+     /// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
+     pub fn document_order_first(&self) -> Option<Node<'d>> {
+-        let node = self.nodes.iter().next()?;
+-
+         if self.nodes.len() == 1 {
+-            return Some(node.clone());
++            return self.nodes.iter().next().cloned();
+         }
+ 
+-        let order = DocOrder::new(node.document());
+-
+-        self.nodes.iter().min_by_key(|n| order.order_of(n)).cloned()
++        self.document_order().into_iter().next()
+     }
+ 
++    /// Returns the nodes in [document order]. An attribute comes
++    /// after its element and before the element's children.
++    ///
++    /// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
+     pub fn document_order(&self) -> Vec<Node<'d>> {
+-        let mut nodes: Vec<_> = self.iter().collect();
+-        if nodes.len() == 1 {
+-            return nodes;
++        if self.nodes.len() <= 1 {
++            return self.iter().collect();
+         }
+ 
+-        let doc = match nodes.first().map(Node::document) {
+-            Some(doc) => doc,
+-            None => return nodes,
+-        };
+-
+-        let order = DocOrder::new(doc);
+-        nodes.sort_by_key(|n| order.order_of(n));
+-        nodes
+-    }
+-}
+-
+-impl<'d> Extend<Node<'d>> for Nodeset<'d> {
+-    fn extend<I>(&mut self, iter: I)
+-    where
+-        I: IntoIterator<Item = Node<'d>>,
+-    {
+-        self.nodes.extend(iter)
+-    }
+-}
+-
+-// Rebuilding this multiple times cannot possibly be performant,
+-// but I want to see how widely used this is first before
+-// picking an appropriate caching point.
+-struct DocOrder<'d>(HashMap<Node<'d>, usize>);
+-
+-impl<'d> DocOrder<'d> {
+-    fn new(doc: dom::Document<'d>) -> Self {
+-        let mut idx = 0;
+-        let mut stack: Vec<Node<'_>> = vec![doc.root().into()];
++        // Only the parts of the tree that lead to a node in the set
++        // are walked, so the cost depends on the size of the set and
++        // how deep its nodes are, not on the size of the document.
+         #[allow(clippy::mutable_key_type)]
+-        let mut order = HashMap::new();
++        let mut leads_to_member: HashSet<Node<'d>> = HashSet::new();
++        let mut stack = Vec::new();
++        for node in &self.nodes {
++            let mut current = node.clone();
++            while leads_to_member.insert(current.clone()) {
++                match current.parent() {
++                    Some(parent) => current = parent,
++                    None => {
++                        stack.push(current);
++                        break;
++                    }
++                }
++            }
++        }
+ 
+-        while let Some(n) = stack.pop() {
+-            order.insert(n.clone(), idx);
+-            idx += 1;
++        let mut ordered = Vec::with_capacity(self.nodes.len());
++        while let Some(node) = stack.pop() {
++            if self.nodes.contains(&node) {
++                ordered.push(node.clone());
++                if ordered.len() == self.nodes.len() {
++                    return ordered;
++                }
++            }
+ 
+-            stack.extend(n.children().into_iter().rev());
++            stack.extend(
++                node.children()
++                    .into_iter()
++                    .rev()
++                    .filter(|child| leads_to_member.contains(child)),
++            );
+ 
+-            if let Node::Element(e) = &n {
++            if let Node::Element(e) = &node {
+                 // TODO: namespaces
+-                stack.extend(e.attributes().into_iter().map(Node::Attribute));
++                stack.extend(
++                    e.attributes()
++                        .into_iter()
++                        .map(Node::Attribute)
++                        .filter(|attribute| self.nodes.contains(attribute)),
++                );
+             }
+         }
+ 
+-        DocOrder(order)
++        // Nodes that the walk can't reach (namespaces) go last.
++        #[allow(clippy::mutable_key_type)]
++        let reached: HashSet<Node<'d>> = ordered.iter().cloned().collect();
++        ordered.extend(self.nodes.iter().filter(|n| !reached.contains(n)).cloned());
++        ordered
+     }
++}
+ 
+-    fn order_of(&self, node: &Node<'d>) -> usize {
+-        self.0.get(node).cloned().unwrap_or(usize::MAX)
++impl<'d> Extend<Node<'d>> for Nodeset<'d> {
++    fn extend<I>(&mut self, iter: I)
++    where
++        I: IntoIterator<Item = Node<'d>>,
++    {
++        self.nodes.extend(iter)
+     }
+ }
+ 
+-- 
+2.53.0
+
