@@ -1,0 +1,188 @@
+From d781d83375e71de51846b53acc8bf28fd6db085f Mon Sep 17 00:00:00 2001
+From: Brendan Long <self@brendanlong.com>
+Date: Wed, 11 Nov 2026 23:01:12 +0000
+Subject: [PATCH 4/4] Store small node sets as a vector instead of a hash set
+
+---
+ src/expression.rs |  7 ++++-
+ src/nodeset.rs    | 73 +++++++++++++++++++++++++++++++++++++----------
+ 2 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/src/expression.rs b/src/expression.rs
+index 2ee2ab4..b38d87c 100644
+--- a/src/expression.rs
++++ b/src/expression.rs
+@@ -539,7 +539,12 @@ where
+                 nodes = predicate.select(context, nodes)?;
+             }
+ 
+-            unique.extend(Vec::from(nodes));
++            if unique.size() == 0 {
++                // An axis never selects the same node twice
++                unique = Nodeset::from_unique_nodes(nodes.into());
++            } else {
++                unique.extend(Vec::from(nodes));
++            }
+         }
+ 
+         Ok(unique)
+diff --git a/src/nodeset.rs b/src/nodeset.rs
+index b0c585c..de9223a 100644
+--- a/src/nodeset.rs
++++ b/src/nodeset.rs
+@@ -1,7 +1,6 @@
+ //! Support for collections of nodes.
+ 
+ use std::borrow::ToOwned;
+-use std::collections::hash_set;
+ use rustc_hash::FxHashSet;
+ use std::iter::{FromIterator, IntoIterator};
+ use std::usize;
+@@ -366,10 +365,24 @@ impl<'d> From<dom::ParentOfChild<'d>> for Node<'d> {
+     }
+ }
+ 
+-/// An unordered collection of unique nodes
+-#[derive(Debug, Default, Clone, PartialEq)]
++/// A collection of unique nodes. Iteration is in the order the nodes
++/// were added, which is not necessarily [document order].
++///
++/// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
++#[derive(Debug, Default, Clone)]
+ pub struct Nodeset<'d> {
+-    nodes: FxHashSet<Node<'d>>,
++    nodes: Vec<Node<'d>>,
++    // Most sets hold a handful of nodes, where scanning `nodes` is
++    // faster than hashing. Only bigger sets get an index.
++    index: Option<FxHashSet<Node<'d>>>,
++}
++
++const MAX_UNINDEXED_SIZE: usize = 8;
++
++impl<'d> PartialEq for Nodeset<'d> {
++    fn eq(&self, other: &Self) -> bool {
++        self.nodes.len() == other.nodes.len() && self.nodes.iter().all(|n| other.has(n))
++    }
+ }
+ 
+ impl<'d> Nodeset<'d> {
+@@ -377,12 +390,32 @@ impl<'d> Nodeset<'d> {
+         Default::default()
+     }
+ 
++    /// The caller must know that `nodes` has no duplicates
++    pub(crate) fn from_unique_nodes(nodes: Vec<Node<'d>>) -> Nodeset<'d> {
++        let mut nodeset = Nodeset { nodes, index: None };
++        nodeset.index_if_big();
++        nodeset
++    }
++
++    fn index_if_big(&mut self) {
++        if self.index.is_none() && self.nodes.len() > MAX_UNINDEXED_SIZE {
++            self.index = Some(self.nodes.iter().cloned().collect());
++        }
++    }
++
++    fn has(&self, node: &Node<'d>) -> bool {
++        match &self.index {
++            Some(index) => index.contains(node),
++            None => self.nodes.contains(node),
++        }
++    }
++
+     /// Checks if the node is present in the set
+     pub fn contains<N>(&self, node: N) -> bool
+     where
+         N: Into<Node<'d>>,
+     {
+-        self.nodes.contains(&node.into())
++        self.has(&node.into())
+     }
+ 
+     /// Add the given node to the set
+@@ -390,7 +423,15 @@ impl<'d> Nodeset<'d> {
+     where
+         N: Into<Node<'d>>,
+     {
+-        self.nodes.insert(node.into());
++        let node = node.into();
++        if self.has(&node) {
++            return;
++        }
++        if let Some(index) = &mut self.index {
++            index.insert(node.clone());
++        }
++        self.nodes.push(node);
++        self.index_if_big();
+     }
+ 
+     pub fn iter<'a>(&'a self) -> Iter<'a, 'd> {
+@@ -406,7 +447,7 @@ impl<'d> Nodeset<'d> {
+     /// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
+     pub fn document_order_first(&self) -> Option<Node<'d>> {
+         if self.nodes.len() == 1 {
+-            return self.nodes.iter().next().cloned();
++            return self.nodes.first().cloned();
+         }
+ 
+         self.document_order().into_iter().next()
+@@ -442,7 +483,7 @@ impl<'d> Nodeset<'d> {
+ 
+         let mut ordered = Vec::with_capacity(self.nodes.len());
+         while let Some(node) = stack.pop() {
+-            if self.nodes.contains(&node) {
++            if self.has(&node) {
+                 ordered.push(node.clone());
+                 if ordered.len() == self.nodes.len() {
+                     return ordered;
+@@ -462,7 +503,7 @@ impl<'d> Nodeset<'d> {
+                     e.attributes()
+                         .into_iter()
+                         .map(Node::Attribute)
+-                        .filter(|attribute| self.nodes.contains(attribute)),
++                        .filter(|attribute| self.has(attribute)),
+                 );
+             }
+         }
+@@ -480,7 +521,9 @@ impl<'d> Extend<Node<'d>> for Nodeset<'d> {
+     where
+         I: IntoIterator<Item = Node<'d>>,
+     {
+-        self.nodes.extend(iter)
++        for node in iter {
++            self.add(node);
++        }
+     }
+ }
+ 
+@@ -517,14 +560,14 @@ impl<'d> FromIterator<Node<'d>> for Nodeset<'d> {
+     where
+         I: IntoIterator<Item = Node<'d>>,
+     {
+-        Nodeset {
+-            nodes: iterator.into_iter().collect(),
+-        }
++        let mut nodeset = Nodeset::new();
++        nodeset.extend(iterator);
++        nodeset
+     }
+ }
+ 
+ pub struct Iter<'a, 'd> {
+-    iter: hash_set::Iter<'a, Node<'d>>,
++    iter: std::slice::Iter<'a, Node<'d>>,
+ }
+ 
+ impl<'a, 'd: 'a> Iterator for Iter<'a, 'd> {
+@@ -535,7 +578,7 @@ impl<'a, 'd: 'a> Iterator for Iter<'a, 'd> {
+ }
+ 
+ pub struct IntoIter<'d> {
+-    iter: hash_set::IntoIter<Node<'d>>,
++    iter: std::vec::IntoIter<Node<'d>>,
+ }
+ 
+ impl<'d> Iterator for IntoIter<'d> {
+-- 
+2.53.0
+

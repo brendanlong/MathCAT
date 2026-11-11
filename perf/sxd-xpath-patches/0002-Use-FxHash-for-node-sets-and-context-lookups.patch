@@ -1,0 +1,91 @@
+From dfd95a47bb22339a5fe6673a3874f974e83d7fb6 Mon Sep 17 00:00:00 2001
+From: Brendan Long <self@brendanlong.com>
+Date: Wed, 11 Nov 2026 22:58:40 +0000
+Subject: [PATCH 2/4] Use FxHash for node sets and context lookups
+
+---
+ Cargo.toml     | 1 +
+ src/context.rs | 8 ++++----
+ src/nodeset.rs | 8 ++++----
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 32b7c36..74a70f2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,3 +22,4 @@ no-unsafe = ["sxd-document-no-unsafe/no-unsafe"]
+ peresil = "0.3.0"
+ sxd-document-no-unsafe = "0.4.1"
+ snafu = "0.5.0"
++rustc-hash = "2"
+diff --git a/src/context.rs b/src/context.rs
+index 67bb5fb..351f255 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -3,7 +3,7 @@
+ 
+ use sxd_document_no_unsafe::QName;
+ 
+-use std::collections::HashMap;
++use rustc_hash::FxHashMap;
+ use std::iter;
+ 
+ use crate::function;
+@@ -11,11 +11,11 @@ use crate::nodeset::{Node, OrderedNodes};
+ use crate::{OwnedQName, Value};
+ 
+ /// A mapping of names to XPath functions.
+-type Functions = HashMap<OwnedQName, Box<dyn function::Function + 'static>>;
++type Functions = FxHashMap<OwnedQName, Box<dyn function::Function + 'static>>;
+ /// A mapping of names to XPath variables.
+-type Variables<'d> = HashMap<OwnedQName, Value<'d>>;
++type Variables<'d> = FxHashMap<OwnedQName, Value<'d>>;
+ /// A mapping of namespace prefixes to namespace URIs.
+-type Namespaces = HashMap<String, String>;
++type Namespaces = FxHashMap<String, String>;
+ 
+ /// Contains the context in which XPath expressions are executed. The
+ /// context contains functions, variables, and namespace mappings.
+diff --git a/src/nodeset.rs b/src/nodeset.rs
+index 8799615..b0c585c 100644
+--- a/src/nodeset.rs
++++ b/src/nodeset.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::borrow::ToOwned;
+ use std::collections::hash_set;
+-use std::collections::HashSet;
++use rustc_hash::FxHashSet;
+ use std::iter::{FromIterator, IntoIterator};
+ use std::usize;
+ 
+@@ -369,7 +369,7 @@ impl<'d> From<dom::ParentOfChild<'d>> for Node<'d> {
+ /// An unordered collection of unique nodes
+ #[derive(Debug, Default, Clone, PartialEq)]
+ pub struct Nodeset<'d> {
+-    nodes: HashSet<Node<'d>>,
++    nodes: FxHashSet<Node<'d>>,
+ }
+ 
+ impl<'d> Nodeset<'d> {
+@@ -425,7 +425,7 @@ impl<'d> Nodeset<'d> {
+         // are walked, so the cost depends on the size of the set and
+         // how deep its nodes are, not on the size of the document.
+         #[allow(clippy::mutable_key_type)]
+-        let mut leads_to_member: HashSet<Node<'d>> = HashSet::new();
++        let mut leads_to_member: FxHashSet<Node<'d>> = FxHashSet::default();
+         let mut stack = Vec::new();
+         for node in &self.nodes {
+             let mut current = node.clone();
+@@ -469,7 +469,7 @@ impl<'d> Nodeset<'d> {
+ 
+         // Nodes that the walk can't reach (namespaces) go last.
+         #[allow(clippy::mutable_key_type)]
+-        let reached: HashSet<Node<'d>> = ordered.iter().cloned().collect();
++        let reached: FxHashSet<Node<'d>> = ordered.iter().cloned().collect();
+         ordered.extend(self.nodes.iter().filter(|n| !reached.contains(n)).cloned());
+         ordered
+     }
+-- 
+2.53.0
+

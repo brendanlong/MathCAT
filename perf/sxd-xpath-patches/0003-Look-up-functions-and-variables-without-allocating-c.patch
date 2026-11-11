@@ -1,0 +1,159 @@
+From 931e9ec9b5485adab3eff637d41dc265bbd1caf5 Mon Sep 17 00:00:00 2001
+From: Brendan Long <self@brendanlong.com>
+Date: Wed, 11 Nov 2026 22:59:32 +0000
+Subject: [PATCH 3/4] Look up functions and variables without allocating;
+ compare node sets to strings without building a set
+
+---
+ src/context.rs    | 12 +++++-------
+ src/expression.rs | 30 +++++++++---------------------
+ src/lib.rs        | 47 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 60 insertions(+), 29 deletions(-)
+
+diff --git a/src/context.rs b/src/context.rs
+index 351f255..73a2504 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -8,7 +8,7 @@ use std::iter;
+ 
+ use crate::function;
+ use crate::nodeset::{Node, OrderedNodes};
+-use crate::{OwnedQName, Value};
++use crate::{OwnedQName, QNameParts, Value};
+ 
+ /// A mapping of names to XPath functions.
+ type Functions = FxHashMap<OwnedQName, Box<dyn function::Function + 'static>>;
+@@ -177,16 +177,14 @@ impl<'c, 'd> Evaluation<'c, 'd> {
+ 
+     /// Looks up the function with the given name
+     pub fn function_for_name(&self, name: QName<'_>) -> Option<&'c dyn function::Function> {
+-        // FIXME: remove allocation
+-        let name = name.into();
+-        self.functions.get(&name).map(AsRef::as_ref)
++        self.functions
++            .get(&name as &dyn QNameParts)
++            .map(AsRef::as_ref)
+     }
+ 
+     /// Looks up the value of the variable
+     pub fn value_of(&self, name: QName<'_>) -> Option<&Value<'d>> {
+-        // FIXME: remove allocation
+-        let name = name.into();
+-        self.variables.get(&name)
++        self.variables.get(&name as &dyn QNameParts)
+     }
+ 
+     /// Looks up the namespace URI for the given prefix
+diff --git a/src/expression.rs b/src/expression.rs
+index 5cb657f..2ee2ab4 100644
+--- a/src/expression.rs
++++ b/src/expression.rs
+@@ -114,33 +114,21 @@ impl Equal {
+         let left_val = self.left.evaluate(context)?;
+         let right_val = self.right.evaluate(context)?;
+ 
+-        fn str_vals(nodes: &Nodeset<'_>) -> HashSet<String> {
+-            nodes.iter().map(|n| n.string_value()).collect()
+-        }
+-
+-        fn num_vals(nodes: &Nodeset<'_>) -> Vec<f64> {
+-            // f64 isn't hashable...
+-            nodes
+-                .iter()
+-                .map(|n| Value::String(n.string_value()).number())
+-                .collect()
+-        }
+-
+         let v = match (&left_val, &right_val) {
+             (Value::Nodeset(left_nodes), Value::Nodeset(right_nodes)) => {
+-                let left_strings = str_vals(left_nodes);
+-                let right_strings = str_vals(right_nodes);
+-                !left_strings.is_disjoint(&right_strings)
++                let left_strings: HashSet<String> =
++                    left_nodes.iter().map(|n| n.string_value()).collect();
++                right_nodes
++                    .iter()
++                    .any(|n| left_strings.contains(&n.string_value()))
+             }
+             (&Value::Nodeset(ref nodes), &Number(val))
+-            | (&Number(val), &Value::Nodeset(ref nodes)) => {
+-                let numbers = num_vals(nodes);
+-                numbers.contains(&val)
+-            }
++            | (&Number(val), &Value::Nodeset(ref nodes)) => nodes
++                .iter()
++                .any(|n| Value::String(n.string_value()).number() == val),
+             (&Value::Nodeset(ref nodes), &Value::String(ref val))
+             | (&Value::String(ref val), &Value::Nodeset(ref nodes)) => {
+-                let strings = str_vals(nodes);
+-                strings.contains(val)
++                nodes.iter().any(|n| n.string_value() == *val)
+             }
+             (&Boolean(_), _) | (_, &Boolean(_)) => left_val.boolean() == right_val.boolean(),
+             (&Number(_), _) | (_, &Number(_)) => left_val.number() == right_val.number(),
+diff --git a/src/lib.rs b/src/lib.rs
+index 7c2e896..af65ca0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -170,12 +170,57 @@ impl<'a> From<&'a OwnedPrefixedName> for OwnedPrefixedName {
+     }
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct OwnedQName {
+     namespace_uri: Option<String>,
+     local_part: String,
+ }
+ 
++/// Lets a map keyed by `OwnedQName` be searched with a borrowed
++/// `QName`, without allocating an `OwnedQName` for the lookup.
++pub(crate) trait QNameParts {
++    fn parts(&self) -> (Option<&str>, &str);
++}
++
++impl QNameParts for OwnedQName {
++    fn parts(&self) -> (Option<&str>, &str) {
++        (self.namespace_uri.as_deref(), &self.local_part)
++    }
++}
++
++impl QNameParts for QName<'_> {
++    fn parts(&self) -> (Option<&str>, &str) {
++        (self.namespace_uri(), self.local_part())
++    }
++}
++
++impl<'a> std::borrow::Borrow<dyn QNameParts + 'a> for OwnedQName {
++    fn borrow(&self) -> &(dyn QNameParts + 'a) {
++        self
++    }
++}
++
++impl std::hash::Hash for dyn QNameParts + '_ {
++    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
++        self.parts().hash(state)
++    }
++}
++
++impl PartialEq for dyn QNameParts + '_ {
++    fn eq(&self, other: &Self) -> bool {
++        self.parts() == other.parts()
++    }
++}
++
++impl Eq for dyn QNameParts + '_ {}
++
++// Must hash the same way as `dyn QNameParts`
++impl std::hash::Hash for OwnedQName {
++    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
++        self.parts().hash(state)
++    }
++}
++
+ impl<'a> From<&'a str> for OwnedQName {
+     fn from(local_part: &'a str) -> Self {
+         OwnedQName {
+-- 
+2.53.0
+
